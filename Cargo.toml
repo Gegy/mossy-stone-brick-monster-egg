@@ -5,7 +5,9 @@ authors = ["gegy1000 <gegy1000@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-serenity = "0.8"
+serenity = "0.9"
+tokio = { version = "0.2", features = ["macros", "fs"] }
+async-trait = "0.1"
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

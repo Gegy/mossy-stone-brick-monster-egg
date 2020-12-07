@@ -77,79 +77,79 @@ impl Group {
     }
 }
 
-pub fn add_reaction(ctx: Context, reaction: Reaction) -> serenity::Result<()> {
-    let guild = match reaction.guild_id {
-        Some(guild) => guild,
-        None => return Ok(()),
+pub async fn add_reaction(ctx: Context, reaction: Reaction) -> serenity::Result<()> {
+    let (guild, user) = match (reaction.guild_id, reaction.user_id) {
+        (Some(guild), Some(user)) => (guild, user),
+        _ => return Ok(()),
     };
 
-    let data = ctx.data.read();
+    let data = ctx.data.read().await;
     let messages = data.get::<ReactionRoleKey>().unwrap();
 
     if let Some(group) = messages.get_group(reaction.message_id) {
         let emoji = reaction.emoji.clone().into();
         match group.get_role(&emoji) {
             Some(role) => {
-                let mut member: Member = guild.member(&ctx, reaction.user_id)?;
-                if !member.user.read().bot {
-                    member.add_role(&ctx.http, role)?;
+                let mut member: Member = guild.member(&ctx, user).await?;
+                if !member.user.bot {
+                    member.add_role(&ctx.http, role).await?;
                 }
             }
-            None => reaction.delete(&ctx)?,
+            None => reaction.delete(&ctx.http).await?,
         }
     }
 
     Ok(())
 }
 
-pub fn remove_reaction(ctx: Context, reaction: Reaction) -> serenity::Result<()> {
-    let guild = match reaction.guild_id {
-        Some(guild) => guild,
-        None => return Ok(()),
+pub async fn remove_reaction(ctx: &Context, reaction: Reaction) -> serenity::Result<()> {
+    let (guild, user) = match (reaction.guild_id, reaction.user_id) {
+        (Some(guild), Some(user)) => (guild, user),
+        _ => return Ok(()),
     };
 
-    let data = ctx.data.read();
+    let data = ctx.data.read().await;
     let messages = data.get::<ReactionRoleKey>().unwrap();
 
     if let Some(group) = messages.get_group(reaction.message_id) {
         let emoji = reaction.emoji.clone().into();
         if let Some(role) = group.get_role(&emoji) {
-            let mut member: Member = guild.member(&ctx, reaction.user_id)?;
-            member.remove_role(&ctx.http, role)?;
+            let mut member: Member = guild.member(ctx, user).await?;
+            member.remove_role(&ctx.http, role).await?;
         }
     }
 
     Ok(())
 }
 
-fn is_message_registered(ctx: &Context, message: MessageId) -> bool {
-    let data = ctx.data.read();
+async fn is_message_registered(ctx: &Context, message: MessageId) -> bool {
+    let data = ctx.data.read().await;
     let messages = data.get::<ReactionRoleKey>().unwrap();
 
     messages.contains_group(message)
 }
 
-pub fn delete_message(ctx: Context, message: MessageId) {
-    if !is_message_registered(&ctx, message) {
+pub async fn delete_message(ctx: Context, message: MessageId) {
+    if !is_message_registered(&ctx, message).await {
         return;
     }
 
-    let mut data = ctx.data.write();
+    let mut data = ctx.data.write().await;
     let messages = data.get_mut::<ReactionRoleKey>().unwrap();
 
     messages.write(|messages| {
         messages.remove_group(message);
-    });
+    }).await;
 }
 
-pub fn update_message(mut ctx: Context, channel: ChannelId, message: MessageId, content: Option<String>) {
+pub async fn update_message(mut ctx: Context, channel: ChannelId, message: MessageId, content: Option<String>) {
     if let Some(content) = content {
-        if !is_message_registered(&ctx, message) {
+        if !is_message_registered(&ctx, message).await {
             return;
         }
 
         {
-            let mut data = ctx.data.write();
+            let mut data = ctx.data.write().await;
             let messages = data.get_mut::<ReactionRoleKey>().unwrap();
 
             messages.write(|messages| {
@@ -159,30 +159,30 @@ pub fn update_message(mut ctx: Context, channel: ChannelId, message: MessageId, 
                         group.insert_role(emoji, role);
                     }
                 }
-            });
+            }).await;
         }
 
-        apply_group_reactions(&mut ctx, channel, message);
+        apply_group_reactions(&mut ctx, channel, message).await;
     }
 }
 
-fn apply_group_reactions(ctx: &mut Context, channel: ChannelId, message: MessageId) {
-    let data = ctx.data.read();
+async fn apply_group_reactions(ctx: &Context, channel: ChannelId, message: MessageId) {
+    let data = ctx.data.read().await;
     let messages = data.get::<ReactionRoleKey>().unwrap();
 
     if let Some(group) = messages.get_group(message) {
-        if let Ok(target_message) = channel.message(&ctx.http, message) {
-            let current_user = ctx.cache.read().user.id;
+        if let Ok(target_message) = channel.message(&ctx.http, message).await {
+            let current_user = ctx.cache.current_user_id().await;
 
             let own_reactions = target_message.reactions.iter()
                 .filter(|reaction| reaction.me);
 
             for reaction in own_reactions {
-                let _ = ctx.http.delete_reaction(channel.0, message.0, Some(current_user.0), &reaction.reaction_type);
+                let _ = ctx.http.delete_reaction(channel.0, message.0, Some(current_user.0), &reaction.reaction_type).await;
             }
 
             for (emoji, _) in group.iter() {
-                let _ = target_message.react(&ctx, emoji.clone());
+                let _ = target_message.react(ctx, emoji.clone()).await;
             }
         }
     }
@@ -233,27 +233,27 @@ fn parse_group(content: &str) -> Vec<(Emoji, RoleId)> {
 }
 
 #[command]
-pub fn track_reactions(ctx: &mut Context, msg: &Message, mut args: Args) -> CommandResult {
+pub async fn track_reactions(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     // TODO: error handling
     let message_id = MessageId(args.single::<u64>().unwrap());
 
-    let _ = msg.delete(&ctx);
+    let _ = msg.delete(ctx).await;
 
-    if let Ok(target_message) = msg.channel_id.message(&ctx.http, message_id) {
+    if let Ok(target_message) = msg.channel_id.message(&ctx.http, message_id).await {
         {
-            let mut data = ctx.data.write();
+            let mut data = ctx.data.write().await;
             let messages = data.get_mut::<ReactionRoleKey>().unwrap();
             messages.write(|messages| {
                 let group = messages.get_or_create_group(message_id);
                 for (emoji, role) in parse_group(&target_message.content) {
                     group.insert_role(emoji, role);
                 }
-            });
+            }).await;
         }
 
-        apply_group_reactions(ctx, msg.channel_id, message_id);
+        apply_group_reactions(ctx, msg.channel_id, message_id).await;
     } else {
-        let _ = msg.reply(&ctx, "failed to find message with that id! make sure it's in this channel");
+        let _ = msg.reply(ctx, "failed to find message with that id! make sure it's in this channel").await;
     }
 
     Ok(())
