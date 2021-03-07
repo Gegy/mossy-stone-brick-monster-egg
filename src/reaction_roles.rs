@@ -3,14 +3,10 @@ use std::str::FromStr;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serenity::framework::standard::{
-    Args, CommandResult,
-    macros::command,
-};
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 
-use super::Config;
+use super::{Config, CommandError, CommandResult};
 
 pub struct ReactionRoleKey;
 
@@ -232,14 +228,12 @@ fn parse_group(content: &str) -> Vec<(Emoji, RoleId)> {
     group
 }
 
-#[command]
-pub async fn track_reactions(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
-    // TODO: error handling
-    let message_id = MessageId(args.single::<u64>().unwrap());
+pub async fn track_reactions(ctx: &Context, command: &Message, message_id: u64) -> CommandResult {
+    let message_id = MessageId(message_id);
 
-    let _ = msg.delete(ctx).await;
+    command.delete(ctx).await?;
 
-    if let Ok(target_message) = msg.channel_id.message(&ctx.http, message_id).await {
+    if let Ok(target_message) = command.channel_id.message(&ctx.http, message_id).await {
         {
             let mut data = ctx.data.write().await;
             let messages = data.get_mut::<ReactionRoleKey>().unwrap();
@@ -251,12 +245,12 @@ pub async fn track_reactions(ctx: &Context, msg: &Message, mut args: Args) -> Co
             }).await;
         }
 
-        apply_group_reactions(ctx, msg.channel_id, message_id).await;
-    } else {
-        let _ = msg.reply(ctx, "failed to find message with that id! make sure it's in this channel").await;
-    }
+        apply_group_reactions(ctx, command.channel_id, message_id).await;
 
-    Ok(())
+        Ok(())
+    } else {
+        Err(CommandError::InvalidMessageReference)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

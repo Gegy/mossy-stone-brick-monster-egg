@@ -6,9 +6,6 @@ use async_trait::async_trait;
 use log::{error, info};
 use serde::{de::DeserializeOwned, Serialize};
 use serenity::client::bridge::gateway::GatewayIntents;
-use serenity::framework::standard::{Args, CheckResult, CommandOptions};
-use serenity::framework::standard::macros::{check, group};
-use serenity::framework::StandardFramework;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 use tokio::fs::File;
@@ -17,12 +14,6 @@ use tokio::prelude::*;
 use reaction_roles::*;
 
 mod reaction_roles;
-
-#[group]
-#[only_in(guilds)]
-#[checks(Admin)]
-#[commands(track_reactions)]
-struct ReactionRoles;
 
 pub struct Config<T: Serialize + DeserializeOwned + Default> {
     path: PathBuf,
@@ -82,20 +73,9 @@ async fn main() {
 
     let token = env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
 
-    let http = serenity::http::Http::new_with_token(&token);
-    let info = http.get_current_application_info().await.expect("failed to get application info");
-
-    let framework = StandardFramework::new()
-        .configure(|c| {
-            c.on_mention(Some(info.id))
-                .case_insensitivity(true)
-        })
-        .group(&REACTIONROLES_GROUP);
-
     let mut client = Client::builder(token)
         .event_handler(Handler)
-        .framework(framework)
-        .intents(GatewayIntents::GUILD_MESSAGE_REACTIONS | GatewayIntents::GUILD_MESSAGES)
+        .intents(GatewayIntents::GUILD_MESSAGE_REACTIONS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS)
         .await
         .expect("failed to create client");
 
@@ -111,7 +91,14 @@ struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn message_delete(&self, ctx: Context, _channel_id: ChannelId, deleted_message_id: MessageId) {
+    async fn message(&self, ctx: Context, message: Message) {
+        if let Ok(true) = message.mentions_me(&ctx).await {
+            let tokens: Vec<&str> = message.content.split_ascii_whitespace().collect();
+            handle_command(&tokens[1..], &ctx, &message).await;
+        }
+    }
+
+    async fn message_delete(&self, ctx: Context, _channel_id: ChannelId, deleted_message_id: MessageId, _guild_id: Option<GuildId>) {
         reaction_roles::delete_message(ctx, deleted_message_id).await;
     }
 
@@ -136,16 +123,48 @@ impl EventHandler for Handler {
     }
 }
 
-#[check]
-#[name = "Admin"]
-#[check_in_help(true)]
-async fn admin_check(ctx: &Context, msg: &Message, _: &mut Args, _: &CommandOptions) -> CheckResult {
-    if let Ok(member) = msg.member(ctx).await {
-        if let Ok(permissions) = member.permissions(&ctx.cache).await {
-            let administrator = permissions.administrator();
-            return administrator.into();
+async fn handle_command(tokens: &[&str], ctx: &Context, message: &Message) {
+    let admin = check_message_admin(&ctx, &message).await;
+
+    let result = match tokens {
+        ["track", reference] if admin => {
+            match reference.parse::<u64>() {
+                Ok(reference) => reaction_roles::track_reactions(&ctx, &message, reference).await,
+                Err(_) => Err(CommandError::MalformedArgument(reference.to_string())),
+            }
+        },
+        _ => Err(CommandError::InvalidCommand),
+    };
+
+    let reaction = if result.is_ok() { "✅" } else { "❌" };
+    let _ = message.react(&ctx, ReactionType::Unicode(reaction.to_owned())).await;
+
+    if let Err(err) = result {
+        let _ = message.reply(&ctx, err).await;
+    }
+}
+
+pub async fn check_message_admin(ctx: &Context, message: &Message) -> bool {
+    if let Ok(member) = message.member(&ctx).await {
+        if let Ok(permissions) = member.permissions(&ctx).await {
+            return permissions.administrator();
         }
     }
+    false
+}
 
-    CheckResult::new_unknown()
+pub type CommandResult = std::result::Result<(), CommandError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum CommandError {
+    #[error("Discord error!")]
+    Serenity(#[from] serenity::Error),
+    #[error("Invalid command!")]
+    InvalidCommand,
+    #[error("You are not allowed to do this!")]
+    NotAllowed,
+    #[error("Invalid message reference! Are you sure it's in this channel?")]
+    InvalidMessageReference,
+    #[error("Malformed argument: {0}")]
+    MalformedArgument(String)
 }
