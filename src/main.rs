@@ -1,10 +1,9 @@
-use std::env;
 use std::ops::Deref;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use log::{error, info};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Serialize, Deserialize};
 use serenity::client::bridge::gateway::GatewayIntents;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
@@ -12,15 +11,16 @@ use tokio::fs::File;
 use tokio::prelude::*;
 
 use reaction_roles::*;
+use regex::Regex;
 
 mod reaction_roles;
 
-pub struct Config<T: Serialize + DeserializeOwned + Default> {
+pub struct Persistent<T: Serialize + DeserializeOwned + Default> {
     path: PathBuf,
     inner: T,
 }
 
-impl<T: Serialize + DeserializeOwned + Default> Config<T> {
+impl<T: Serialize + DeserializeOwned + Default> Persistent<T> {
     pub async fn open(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
 
@@ -35,7 +35,7 @@ impl<T: Serialize + DeserializeOwned + Default> Config<T> {
             T::default()
         };
 
-        Config { path, inner }
+        Persistent { path, inner }
     }
 
     #[inline]
@@ -58,7 +58,7 @@ impl<T: Serialize + DeserializeOwned + Default> Config<T> {
     }
 }
 
-impl<T: Serialize + DeserializeOwned + Default> Deref for Config<T> {
+impl<T: Serialize + DeserializeOwned + Default> Deref for Persistent<T> {
     type Target = T;
 
     #[inline]
@@ -67,30 +67,73 @@ impl<T: Serialize + DeserializeOwned + Default> Deref for Config<T> {
     }
 }
 
+#[derive(Serialize, Deserialize, Default)]
+pub struct Config {
+    pub discord_token: String,
+    pub ban_regex: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
-    let token = env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
+    let config: Persistent<Config> = Persistent::open("config.json").await;
+    let name_filter = NameFilter::new(&config);
 
-    let mut client = Client::builder(token)
-        .event_handler(Handler)
-        .intents(GatewayIntents::GUILD_MESSAGE_REACTIONS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS)
+    let mut client = Client::builder(&config.discord_token)
+        .event_handler(Handler { name_filter })
+        .intents(
+            GatewayIntents::GUILD_MESSAGE_REACTIONS
+                | GatewayIntents::GUILD_MESSAGES
+                | GatewayIntents::GUILDS
+                | GatewayIntents::GUILD_MEMBERS
+        )
         .await
         .expect("failed to create client");
 
     {
         let mut data = client.data.write().await;
-        data.insert::<ReactionRoleKey>(Config::open("reaction_roles.json").await);
+        data.insert::<ReactionRoleKey>(Persistent::open("reaction_roles.json").await);
     }
 
     client.start().await.expect("failed to run client");
 }
 
-struct Handler;
+struct NameFilter {
+    regex: Vec<Regex>,
+}
+
+impl NameFilter {
+    fn new(config: &Config) -> NameFilter {
+        NameFilter {
+            regex: config.ban_regex.iter()
+                .map(|regex| Regex::new(regex).unwrap())
+                .collect()
+        }
+    }
+
+    fn is_illegal(&self, name: &str) -> bool {
+        self.regex.iter().any(|regex| regex.is_match(name))
+    }
+}
+
+struct Handler {
+    name_filter: NameFilter,
+}
 
 #[async_trait]
 impl EventHandler for Handler {
+    async fn guild_member_addition(&self, ctx: Context, guild_id: GuildId, member: Member) {
+        if self.name_filter.is_illegal(&member.user.name) {
+            let permissions = get_permissions(&ctx, guild_id, ctx.cache.current_user_id().await).await;
+            if permissions.ban_members() {
+                if let Err(err) = member.ban_with_reason(&ctx.http, 0, "Illegal username!").await {
+                    error!("failed to ban user with illegal name! {:?}", err);
+                }
+            }
+        }
+    }
+
     async fn message(&self, ctx: Context, message: Message) {
         if let Ok(true) = message.mentions_me(&ctx).await {
             let tokens: Vec<&str> = message.content.split_ascii_whitespace().collect();
@@ -145,12 +188,19 @@ async fn handle_command(tokens: &[&str], ctx: &Context, message: &Message) {
 }
 
 pub async fn check_message_admin(ctx: &Context, message: &Message) -> bool {
-    if let Ok(member) = message.member(&ctx).await {
+    match message.guild_id {
+        Some(guild_id) => get_permissions(ctx, guild_id, message.author.id).await.administrator(),
+        None => false,
+    }
+}
+
+async fn get_permissions(ctx: &Context, guild_id: GuildId, user_id: UserId) -> Permissions {
+    if let Some(member) = ctx.cache.member(guild_id, user_id).await {
         if let Ok(permissions) = member.permissions(&ctx).await {
-            return permissions.administrator();
+            return permissions;
         }
     }
-    false
+    Permissions::empty()
 }
 
 pub type CommandResult = std::result::Result<(), CommandError>;

@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 
-use super::{Config, CommandError, CommandResult};
+use super::{Persistent, CommandError, CommandResult};
 
 pub struct ReactionRoleKey;
 
 impl TypeMapKey for ReactionRoleKey {
-    type Value = Config<Messages>;
+    type Value = Persistent<Messages>;
 }
 
 #[derive(Serialize, Deserialize, Default)]
