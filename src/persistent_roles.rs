@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future;
+use std::time::Duration;
 
 use log::error;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,6 @@ use serenity::model::prelude::*;
 use serenity::prelude::*;
 
 use crate::{CommandError, CommandResult, Persistent};
-use std::time::Duration;
 
 pub struct StateKey;
 
@@ -27,25 +27,69 @@ struct GuildState {
     users: HashMap<UserId, Vec<RoleId>>,
 }
 
+impl GuildState {
+    pub fn set_user_roles(&mut self, user: UserId, roles: Vec<RoleId>) {
+        if !roles.is_empty() {
+            self.users.insert(user, roles);
+        } else {
+            self.users.remove(&user);
+        }
+    }
+
+    pub fn add_role(&mut self, role: RoleId, users_with_role: Vec<UserId>) {
+        if self.roles.insert(role) {
+            for user in users_with_role {
+                let roles = self.users.entry(user).or_insert_with(|| Vec::new());
+                roles.push(role);
+            }
+        }
+    }
+
+    pub fn remove_role(&mut self, role: RoleId) {
+        if self.roles.remove(&role) {
+            let mut empty_users = Vec::new();
+
+            for (user, roles) in &mut self.users {
+                if let Some(index) = roles.iter().position(|r| *r == role) {
+                    roles.swap_remove(index);
+                }
+
+                if roles.is_empty() {
+                    empty_users.push(*user);
+                }
+            }
+
+            for user in empty_users {
+                self.users.remove(&user);
+            }
+        }
+    }
+}
+
 pub async fn add_role(ctx: &Context, command: &Message, role: RoleId) -> CommandResult<()> {
     if let Some(guild) = command.guild_id {
         let mut data = ctx.data.write().await;
 
-        let users_with_role: Vec<UserId> = guild.members_iter(ctx)
-            .try_filter(|member| future::ready(member.roles.contains(&role)))
-            .map_ok(|member| member.user.id)
-            .try_collect()
-            .await?;
+        let users_with_role = users_with_role(ctx, guild, role).await?;
 
         let state = data.get_mut::<StateKey>().unwrap();
         state.write(|state| {
-            add_role_to(role, guild, state, users_with_role);
+            let guild = state.guilds.entry(guild).or_insert_with(|| GuildState::default());
+            guild.add_role(role, users_with_role);
         }).await;
 
         Ok(())
     } else {
         Err(CommandError::NotAllowed)
     }
+}
+
+async fn users_with_role(ctx: &Context, guild: GuildId, role: RoleId) -> serenity::Result<Vec<UserId>> {
+    guild.members_iter(ctx)
+        .try_filter(|member| future::ready(member.roles.contains(&role)))
+        .map_ok(|member| member.user.id)
+        .try_collect()
+        .await
 }
 
 pub async fn remove_role(ctx: &Context, command: &Message, role: RoleId) -> CommandResult<()> {
@@ -55,33 +99,13 @@ pub async fn remove_role(ctx: &Context, command: &Message, role: RoleId) -> Comm
         let state = data.get_mut::<StateKey>().unwrap();
         state.write(|state| {
             if let Some(guild) = state.guilds.get_mut(&guild) {
-                remove_role_from(&role, guild)
+                guild.remove_role(role);
             }
         }).await;
 
         Ok(())
     } else {
         Err(CommandError::NotAllowed)
-    }
-}
-
-fn add_role_to(role: RoleId, guild: GuildId, state: &mut State, users_with_role: Vec<UserId>) {
-    let guild = state.guilds.entry(guild).or_insert_with(|| GuildState::default());
-    guild.roles.insert(role);
-
-    for user in users_with_role {
-        let roles = guild.users.entry(user).or_insert_with(|| Vec::new());
-        roles.push(role);
-    }
-}
-
-fn remove_role_from(role: &RoleId, guild: &mut GuildState) {
-    guild.roles.remove(&role);
-
-    for (_, roles) in &mut guild.users {
-        if let Some(index) = roles.iter().position(|r| r == role) {
-            roles.swap_remove(index);
-        }
     }
 }
 
@@ -123,7 +147,8 @@ pub async fn guild_member_update(ctx: &Context, member: &Member) {
                 .filter(|role| guild.roles.contains(role))
                 .cloned()
                 .collect();
-            guild.users.insert(member.user.id, roles);
+
+            guild.set_user_roles(member.user.id, roles);
         }
     }).await;
 }
