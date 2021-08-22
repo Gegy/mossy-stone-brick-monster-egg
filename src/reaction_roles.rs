@@ -16,7 +16,7 @@ impl TypeMapKey for StateKey {
     type Value = Persistent<State>;
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone, Eq, PartialEq)]
 pub struct State(HashMap<MessageId, Selector>);
 
 impl State {

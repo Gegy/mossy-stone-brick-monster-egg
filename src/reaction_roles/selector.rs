@@ -5,7 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serenity::model::prelude::*;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone, Eq, PartialEq)]
 pub struct Selector(HashMap<Emoji, RoleId>);
 
 impl Selector {

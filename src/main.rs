@@ -16,7 +16,7 @@ mod reaction_roles;
 mod persistent_roles;
 mod name_filter;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone, Eq, PartialEq)]
 pub struct Config {
     pub discord_token: String,
     pub ban_regex: Vec<String>,
@@ -57,7 +57,7 @@ struct Handler {
 impl EventHandler for Handler {
     async fn guild_member_addition(&self, ctx: Context, guild_id: GuildId, mut member: Member) {
         if self.name_filter.is_illegal(&member.user.name) {
-            let permissions = get_permissions(&ctx, guild_id, ctx.cache.current_user_id().await).await;
+            let permissions = member_permissions(&ctx, guild_id, ctx.cache.current_user_id().await).await;
             if permissions.ban_members() {
                 if let Err(err) = member.ban_with_reason(&ctx.http, 0, "Illegal username!").await {
                     error!("failed to ban user with illegal name! {:?}", err);
@@ -68,10 +68,8 @@ impl EventHandler for Handler {
         persistent_roles::guild_member_addition(&ctx, &mut member).await;
     }
 
-    async fn guild_member_removal(&self, ctx: Context, _guild_id: GuildId, _user: User, member: Option<Member>) {
-        if let Some(mut member) = member {
-            persistent_roles::guild_member_removal(&ctx, &mut member).await;
-        }
+    async fn guild_member_update(&self, ctx: Context, _old: Option<Member>, member: Member) {
+        persistent_roles::guild_member_update(&ctx, &member).await;
     }
 
     async fn message(&self, ctx: Context, message: Message) {
@@ -118,20 +116,29 @@ async fn handle_command(tokens: &[&str], ctx: &Context, message: &Message) {
 }
 
 async fn try_handle_command(tokens: &[&str], ctx: &Context, message: &Message) -> CommandResult<()> {
-    let admin = check_message_admin(&ctx, &message).await;
+    let permissions = message_permissions(&ctx, &message).await;
 
     match tokens {
-        ["add", "role", "selector", reference] if admin => {
+        ["add", "role", "selector", reference] => {
+            require_permission(permissions, Permissions::MANAGE_ROLES)?;
             let reference = parse_argument(reference)?;
             reaction_roles::add_selector(&ctx, &message, MessageId(reference)).await
         }
-        ["persist", "role", reference] if admin => {
-            let reference = parse_argument(reference)?;
-            persistent_roles::persist_role(&ctx, &message, RoleId(reference)).await
+        ["add", "role", "persist", refs @ ..] => {
+            require_permission(permissions, Permissions::MANAGE_ROLES)?;
+            for reference in refs {
+                let reference = parse_argument(reference)?;
+                persistent_roles::add_role(&ctx, &message, RoleId(reference)).await?;
+            }
+            Ok(())
         }
-        ["stop", "persist", "role", reference] if admin => {
-            let reference = parse_argument(reference)?;
-            persistent_roles::stop_persist_role(&ctx, &message, RoleId(reference)).await
+        ["remove", "role", "persist", refs @ ..] => {
+            require_permission(permissions, Permissions::MANAGE_ROLES)?;
+            for reference in refs {
+                let reference = parse_argument(reference)?;
+                persistent_roles::remove_role(&ctx, &message, RoleId(reference)).await?;
+            }
+            Ok(())
         }
         _ => Err(CommandError::InvalidCommand),
     }
@@ -141,20 +148,29 @@ fn parse_argument<T: FromStr>(argument: &str) -> CommandResult<T> {
     argument.parse::<T>().map_err(|_| CommandError::MalformedArgument(argument.to_owned()))
 }
 
-pub async fn check_message_admin(ctx: &Context, message: &Message) -> bool {
+pub async fn message_permissions(ctx: &Context, message: &Message) -> Permissions {
     match message.guild_id {
-        Some(guild_id) => get_permissions(ctx, guild_id, message.author.id).await.administrator(),
-        None => false,
+        Some(guild_id) => member_permissions(ctx, guild_id, message.author.id).await,
+        None => Permissions::empty(),
     }
 }
 
-async fn get_permissions(ctx: &Context, guild_id: GuildId, user_id: UserId) -> Permissions {
-    if let Some(member) = ctx.cache.member(guild_id, user_id).await {
+pub async fn member_permissions(ctx: &Context, guild: GuildId, user: UserId) -> Permissions {
+    if let Ok(member) = guild.member(ctx, user).await {
         if let Ok(permissions) = member.permissions(&ctx).await {
             return permissions;
         }
     }
     Permissions::empty()
+}
+
+#[inline]
+fn require_permission(permissions: Permissions, require: Permissions) -> CommandResult<()> {
+    if permissions.contains(require) {
+        Ok(())
+    } else {
+        Err(CommandError::NoPermission(require))
+    }
 }
 
 pub type CommandResult<T> = std::result::Result<T, CommandError>;
@@ -167,6 +183,8 @@ pub enum CommandError {
     InvalidCommand,
     #[error("You are not allowed to do this!")]
     NotAllowed,
+    #[error("You are missing `{0}` permission!")]
+    NoPermission(Permissions),
     #[error("Invalid message reference! Are you sure it's in this channel?")]
     InvalidMessageReference,
     #[error("Malformed argument: {0}")]

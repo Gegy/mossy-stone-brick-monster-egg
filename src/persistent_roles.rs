@@ -1,10 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::future;
 
+use log::error;
 use serde::{Deserialize, Serialize};
+use serenity::futures::TryStreamExt;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 
 use crate::{CommandError, CommandResult, Persistent};
+use std::time::Duration;
 
 pub struct StateKey;
 
@@ -12,28 +16,30 @@ impl TypeMapKey for StateKey {
     type Value = Persistent<State>;
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone, Eq, PartialEq)]
 pub struct State {
     guilds: HashMap<GuildId, GuildState>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone, Eq, PartialEq)]
 struct GuildState {
     roles: HashSet<RoleId>,
     users: HashMap<UserId, Vec<RoleId>>,
 }
 
-impl GuildState {}
-
-pub async fn persist_role(ctx: &Context, command: &Message, role: RoleId) -> CommandResult<()> {
+pub async fn add_role(ctx: &Context, command: &Message, role: RoleId) -> CommandResult<()> {
     if let Some(guild) = command.guild_id {
-        command.delete(ctx).await?;
-
         let mut data = ctx.data.write().await;
+
+        let users_with_role: Vec<UserId> = guild.members_iter(ctx)
+            .try_filter(|member| future::ready(member.roles.contains(&role)))
+            .map_ok(|member| member.user.id)
+            .try_collect()
+            .await?;
 
         let state = data.get_mut::<StateKey>().unwrap();
         state.write(|state| {
-            add_role(role, guild, state);
+            add_role_to(role, guild, state, users_with_role);
         }).await;
 
         Ok(())
@@ -42,16 +48,14 @@ pub async fn persist_role(ctx: &Context, command: &Message, role: RoleId) -> Com
     }
 }
 
-pub async fn stop_persist_role(ctx: &Context, command: &Message, role: RoleId) -> CommandResult<()> {
+pub async fn remove_role(ctx: &Context, command: &Message, role: RoleId) -> CommandResult<()> {
     if let Some(guild) = command.guild_id {
-        command.delete(ctx).await?;
-
         let mut data = ctx.data.write().await;
 
         let state = data.get_mut::<StateKey>().unwrap();
         state.write(|state| {
             if let Some(guild) = state.guilds.get_mut(&guild) {
-                remove_role(&role, guild)
+                remove_role_from(&role, guild)
             }
         }).await;
 
@@ -61,12 +65,17 @@ pub async fn stop_persist_role(ctx: &Context, command: &Message, role: RoleId) -
     }
 }
 
-fn add_role(role: RoleId, guild: GuildId, state: &mut State) {
+fn add_role_to(role: RoleId, guild: GuildId, state: &mut State, users_with_role: Vec<UserId>) {
     let guild = state.guilds.entry(guild).or_insert_with(|| GuildState::default());
     guild.roles.insert(role);
+
+    for user in users_with_role {
+        let roles = guild.users.entry(user).or_insert_with(|| Vec::new());
+        roles.push(role);
+    }
 }
 
-fn remove_role(role: &RoleId, guild: &mut GuildState) {
+fn remove_role_from(role: &RoleId, guild: &mut GuildState) {
     guild.roles.remove(&role);
 
     for (_, roles) in &mut guild.users {
@@ -77,35 +86,30 @@ fn remove_role(role: &RoleId, guild: &mut GuildState) {
 }
 
 pub async fn guild_member_addition(ctx: &Context, member: &mut Member) {
-    if !has_guild(ctx, member.guild_id).await {
-        return;
-    }
+    let data = ctx.data.read().await;
+    let state = data.get::<StateKey>().unwrap();
 
-    let manage_roles = member.permissions(ctx).await
-        .map(|permissions| permissions.manage_roles())
-        .unwrap_or(false);
+    let roles = match state.guilds.get(&member.guild_id) {
+        Some(guild) => guild.users.get(&member.user.id).cloned().unwrap_or_default(),
+        None => Vec::default()
+    };
 
-    if !manage_roles {
-        return;
-    }
-
-    let mut data = ctx.data.write().await;
-    let state = data.get_mut::<StateKey>().unwrap();
-
-    let roles = state.write(|state| {
-        if let Some(guild) = state.guilds.get_mut(&member.guild_id) {
-            guild.users.remove(&member.user.id)
-        } else {
-            None
+    if !roles.is_empty() {
+        let permissions = crate::member_permissions(ctx, member.guild_id, ctx.cache.current_user_id().await).await;
+        if !permissions.manage_roles() {
+            return;
         }
-    }).await;
 
-    if let Some(roles) = roles {
-        let _ = member.add_roles(&ctx, &roles).await;
+        // magic delay to make sure adding the roles actually does so
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        if let Err(err) = member.add_roles(&ctx, &roles).await {
+            error!("failed to add persisted roles ({:?}) to {}: {:?}", roles, member, err);
+        }
     }
 }
 
-pub async fn guild_member_removal(ctx: &Context, member: &mut Member) {
+pub async fn guild_member_update(ctx: &Context, member: &Member) {
     if !has_guild(ctx, member.guild_id).await {
         return;
     }
