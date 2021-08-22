@@ -1,71 +1,20 @@
-use std::ops::Deref;
-use std::path::PathBuf;
+// TODO: use slash commands
+use std::str::FromStr;
 
 use async_trait::async_trait;
 use log::{error, info};
-use serde::{de::DeserializeOwned, Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serenity::client::bridge::gateway::GatewayIntents;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
-use tokio::fs::File;
-use tokio::prelude::*;
 
-use reaction_roles::*;
-use regex::Regex;
+pub use name_filter::NameFilter;
+pub use persistent::*;
 
+mod persistent;
 mod reaction_roles;
-
-pub struct Persistent<T: Serialize + DeserializeOwned + Default> {
-    path: PathBuf,
-    inner: T,
-}
-
-impl<T: Serialize + DeserializeOwned + Default> Persistent<T> {
-    pub async fn open(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-
-        let inner = if path.exists() {
-            let mut file = File::open(&path).await.expect("failed to open file");
-
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).await.expect("failed to load file");
-
-            serde_json::from_slice(&bytes).expect("failed to deserialize")
-        } else {
-            T::default()
-        };
-
-        Persistent { path, inner }
-    }
-
-    #[inline]
-    pub async fn write<F, R>(&mut self, f: F) -> R
-        where F: FnOnce(&mut T) -> R
-    {
-        let result = f(&mut self.inner);
-
-        let mut file = File::create(&self.path).await.expect("failed to create file");
-
-        let bytes = serde_json::to_vec(&self.inner).expect("failed to serialize");
-        file.write_all(&bytes).await.expect("failed to write to file");
-
-        result
-    }
-
-    #[inline]
-    pub fn read(&self) -> &T {
-        &self.inner
-    }
-}
-
-impl<T: Serialize + DeserializeOwned + Default> Deref for Persistent<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        &self.inner
-    }
-}
+mod persistent_roles;
+mod name_filter;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
@@ -93,28 +42,11 @@ async fn main() {
 
     {
         let mut data = client.data.write().await;
-        data.insert::<ReactionRoleKey>(Persistent::open("reaction_roles.json").await);
+        data.insert::<reaction_roles::StateKey>(Persistent::open("reaction_roles.json").await);
+        data.insert::<persistent_roles::StateKey>(Persistent::open("persistent_roles.json").await);
     }
 
     client.start().await.expect("failed to run client");
-}
-
-struct NameFilter {
-    regex: Vec<Regex>,
-}
-
-impl NameFilter {
-    fn new(config: &Config) -> NameFilter {
-        NameFilter {
-            regex: config.ban_regex.iter()
-                .map(|regex| Regex::new(regex).unwrap())
-                .collect()
-        }
-    }
-
-    fn is_illegal(&self, name: &str) -> bool {
-        self.regex.iter().any(|regex| regex.is_match(name))
-    }
 }
 
 struct Handler {
@@ -123,7 +55,7 @@ struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn guild_member_addition(&self, ctx: Context, guild_id: GuildId, member: Member) {
+    async fn guild_member_addition(&self, ctx: Context, guild_id: GuildId, mut member: Member) {
         if self.name_filter.is_illegal(&member.user.name) {
             let permissions = get_permissions(&ctx, guild_id, ctx.cache.current_user_id().await).await;
             if permissions.ban_members() {
@@ -131,6 +63,14 @@ impl EventHandler for Handler {
                     error!("failed to ban user with illegal name! {:?}", err);
                 }
             }
+        }
+
+        persistent_roles::guild_member_addition(&ctx, &mut member).await;
+    }
+
+    async fn guild_member_removal(&self, ctx: Context, _guild_id: GuildId, _user: User, member: Option<Member>) {
+        if let Some(mut member) = member {
+            persistent_roles::guild_member_removal(&ctx, &mut member).await;
         }
     }
 
@@ -167,17 +107,7 @@ impl EventHandler for Handler {
 }
 
 async fn handle_command(tokens: &[&str], ctx: &Context, message: &Message) {
-    let admin = check_message_admin(&ctx, &message).await;
-
-    let result = match tokens {
-        ["track", reference] if admin => {
-            match reference.parse::<u64>() {
-                Ok(reference) => reaction_roles::track_reactions(&ctx, &message, reference).await,
-                Err(_) => Err(CommandError::MalformedArgument(reference.to_string())),
-            }
-        },
-        _ => Err(CommandError::InvalidCommand),
-    };
+    let result = try_handle_command(tokens, ctx, message).await;
 
     let reaction = if result.is_ok() { "✅" } else { "❌" };
     let _ = message.react(&ctx, ReactionType::Unicode(reaction.to_owned())).await;
@@ -185,6 +115,30 @@ async fn handle_command(tokens: &[&str], ctx: &Context, message: &Message) {
     if let Err(err) = result {
         let _ = message.reply(&ctx, err).await;
     }
+}
+
+async fn try_handle_command(tokens: &[&str], ctx: &Context, message: &Message) -> CommandResult<()> {
+    let admin = check_message_admin(&ctx, &message).await;
+
+    match tokens {
+        ["add", "role", "selector", reference] if admin => {
+            let reference = parse_argument(reference)?;
+            reaction_roles::add_selector(&ctx, &message, MessageId(reference)).await
+        }
+        ["persist", "role", reference] if admin => {
+            let reference = parse_argument(reference)?;
+            persistent_roles::persist_role(&ctx, &message, RoleId(reference)).await
+        }
+        ["stop", "persist", "role", reference] if admin => {
+            let reference = parse_argument(reference)?;
+            persistent_roles::stop_persist_role(&ctx, &message, RoleId(reference)).await
+        }
+        _ => Err(CommandError::InvalidCommand),
+    }
+}
+
+fn parse_argument<T: FromStr>(argument: &str) -> CommandResult<T> {
+    argument.parse::<T>().map_err(|_| CommandError::MalformedArgument(argument.to_owned()))
 }
 
 pub async fn check_message_admin(ctx: &Context, message: &Message) -> bool {
@@ -203,7 +157,7 @@ async fn get_permissions(ctx: &Context, guild_id: GuildId, user_id: UserId) -> P
     Permissions::empty()
 }
 
-pub type CommandResult = std::result::Result<(), CommandError>;
+pub type CommandResult<T> = std::result::Result<T, CommandError>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum CommandError {
@@ -216,5 +170,5 @@ pub enum CommandError {
     #[error("Invalid message reference! Are you sure it's in this channel?")]
     InvalidMessageReference,
     #[error("Malformed argument: {0}")]
-    MalformedArgument(String)
+    MalformedArgument(String),
 }

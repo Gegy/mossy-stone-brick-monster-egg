@@ -5,8 +5,8 @@ authors = ["Gegy <gegy1000@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-serenity = { version = "0.10", default-features = false, features = ["builder", "cache", "client", "gateway", "model", "http", "rustls_tokio_0_2_backend"] }
-tokio = { version = "0.2", features = ["macros", "fs"] }
+serenity = { version = "0.10", default-features = false, features = ["builder", "cache", "client", "gateway", "model", "http", "rustls_backend"] }
+tokio = { version = "1", features = ["macros", "fs", "rt-multi-thread"] }
 async-trait = "0.1"
 
 thiserror = "1.0"
@@ -14,7 +14,7 @@ thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-regex = "1.4"
+regex = "1.5"
 
 log = "0.4"
-env_logger = "0.7.1"
+env_logger = "0.9"
