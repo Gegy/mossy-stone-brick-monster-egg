@@ -8,18 +8,15 @@ use serenity::client::bridge::gateway::GatewayIntents;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 
-pub use name_filter::NameFilter;
 pub use persistent::*;
 
 mod persistent;
 mod reaction_roles;
 mod persistent_roles;
-mod name_filter;
 
 #[derive(Serialize, Deserialize, Default, Clone, Eq, PartialEq)]
 pub struct Config {
     pub discord_token: String,
-    pub ban_regex: Vec<String>,
 }
 
 #[tokio::main]
@@ -27,10 +24,9 @@ async fn main() {
     env_logger::init();
 
     let config: Persistent<Config> = Persistent::open("config.json").await;
-    let name_filter = NameFilter::new(&config);
 
     let mut client = Client::builder(&config.discord_token)
-        .event_handler(Handler { name_filter })
+        .event_handler(Handler)
         .intents(
             GatewayIntents::GUILD_MESSAGE_REACTIONS
                 | GatewayIntents::GUILD_MESSAGES
@@ -49,22 +45,11 @@ async fn main() {
     client.start().await.expect("failed to run client");
 }
 
-struct Handler {
-    name_filter: NameFilter,
-}
+struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn guild_member_addition(&self, ctx: Context, guild_id: GuildId, mut member: Member) {
-        if self.name_filter.is_illegal(&member.user.name) {
-            let permissions = member_permissions(&ctx, guild_id, ctx.cache.current_user_id().await).await;
-            if permissions.ban_members() {
-                if let Err(err) = member.ban_with_reason(&ctx.http, 0, "Illegal username!").await {
-                    error!("failed to ban user with illegal name! {:?}", err);
-                }
-            }
-        }
-
+    async fn guild_member_addition(&self, ctx: Context, _guild_id: GuildId, mut member: Member) {
         persistent_roles::guild_member_addition(&ctx, &mut member).await;
     }
 
